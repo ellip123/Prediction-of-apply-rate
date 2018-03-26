@@ -1,0 +1,371 @@
+---
+title: 'Apply rate: Prediction Models'
+author: "Xiangyu Liu"
+date: "2018/3/24"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+---
+
+# Research Data
+
+## *R* Libraries
+
+The research uses the libraries loaded below:
+```{r}
+library(knitr)
+library(dplyr)
+library(gridExtra)
+library(ggplot2)
+library(ggthemes)
+library(cowplot)
+library(moments)
+library(caret)
+library(glmnet)
+library(pscl)
+library(ROCR)
+library(class)
+library(gbm)
+library(pROC)
+```
+
+## Importing Glassdoor data sets and splitting into the traning set and test set 
+
+```{r}
+allSet <- read.csv("ozan_p_pApply_intern_challenge_03_20_min.csv", stringsAsFactors = F)
+train <- allSet[allSet$search_date_pacific != '2018-01-27',]
+train <- train[-c(9,10,11)]
+test <- allSet[allSet$search_date_pacific == '2018-01-27',]
+test <- test[-c(9,10,11)]
+```
+
+## Data dimensions and structure
+
+```{r}
+trainDim <- dim(train)
+testDim <- dim(test)
+trainR <- trainDim[1];testR <- testDim[1]
+trainC <- trainDim[2];testC <- testDim[2]
+```
+
+By having a look at the dimensions of the train and test data, we see that they have **1084364** and **116526** observations (houses) and **8** and **8** features, respectively.
+
+```{r}
+glimpse(allSet)
+```
+
+We can also have a glimpse of the data structure. It is clear that we have features that are doubles and characters. It’s worth noticing that the outcome variable (*apply*) is integer.
+
+## Data dictionary
+
+Below is a description of each of the features existing in the data sets to give insight of what information we have about users.
+
+Feature|Description
+-------|-----------------------------------------------------------------------------
+title proximity tfidf|Measures the closeness of query and job title.
+description proximity tfidf|Measures the closeness of query and job description.
+main query tfidf|A score related to user query closeness to job title and job description.
+query jl score|Measures the popularity of query and job listing pair.
+query title score|Measures the popularity of query and job title pair.
+city match|Indicates if the job listing matches to user (or, user-specified) location.
+job age days|Indicates the age of job listing posted.
+
+
+# Data Cleaning
+
+By exploring the data set, as shown in the below subset, we can realize that the data needs to be processed and cleaned. Data cleaning involves handling missing values, fixing features classes, or *coding* character features.
+
+## Imputing missing values
+
+Missing values in data sets are problematic in data analysis, model training and prediction. Hence, we will impute missing values before going further in model training.
+
+Let's first check for missing values 
+
+```{r}
+sapply(train,function(x) sum(is.na(x)))
+```
+
+Great! There are no missing values in our dataset.
+
+# Feature Engineering
+
+*Feature Engineering* simply refers to creating new features from the existing ones to improve model performance. It would make training the model possible, easier, and more accurate in prediction.
+
+## Log transformation
+
+It is a good practice to transform highly skewed numerical variables into their log values. This helps show the relative change in variable values rather than the absolute change for variables not showing normal distribution. Most researchers use the range of -2 to +2 as the acceptable limits of skewness to decide on a variable normality. Hence, we will use this range to log transform values.
+
+```{r}
+# create a new copy of the master data set (allSet)
+allSetNew <- allSet[-c(8:11)]
+
+# get classes of features in the data set
+featureClasses <- sapply(names(allSetNew[]), function(x){class(allSetNew[[x]])})
+
+featureClasses
+# get numeric or integer class features
+numFeatures <- names(featureClasses[featureClasses == "numeric" | featureClasses == "integer"])
+
+# get character class features
+charFeatures <- names(featureClasses[featureClasses == "character"])
+
+# determine skewness of each numeric feature
+skewedVals <- sapply(numFeatures, function(x){skewness(allSetNew[[x]],na.rm = T)})
+
+# identify skewed features with threshold of -2,+2
+skewedFeatures <- skewedVals[skewedVals < -2 | skewedVals > 2]
+
+# log-transform skewed features
+for (i in names(skewedFeatures)) {
+        allSet[[i]] <- log(allSet[[i]] + 1)
+}
+```
+
+# Model Training and Testing
+
+Now, having all features processed and engineered, we can start the model training then testing with all existing features (except the *Id*) as model predictors.
+
+First, we will re-split the full data set into its original *train* and *test* sets.
+
+```{r}
+train <- allSet[allSet$search_date_pacific != '2018-01-27',]
+train <- train[-c(9,10,11)]
+test <- allSet[allSet$search_date_pacific == '2018-01-27',]
+test <- test[-c(9,10,11)]
+```
+
+##Logistic Regression Model
+
+The goal of logistic regression is to describe the relationship between the dichotomous characteristic of interest and a set of independent variables.  Logistic regression generates the coefficients (and its standard errors and significance levels) of a formula to predict a logit transformation of the probability of presence of the characteristic of interest.
+
+```{r}
+model <- glm(apply ~.,family=binomial(link='logit'),data=train)
+summary(model)
+```
+
+Now I can analyze the fitting and interpret what the model is telling us. 
+
+First of all, according to the regression results, most of the variables are highly significant (***), except for description_proximity_tfidf. It suggests a strong association of these variables with the probability of applying. 
+
+Secondly, we can find whether the variable has a positive or negative impact on the dependent variable. For example, query_jl_score and query_title_score would enhance the probability of applying, while job_age_days reduces the probability of applying.
+
+Then I decide to run the anova() function on the model to analyze the table of deviance.
+
+```{r}
+anova(model, test="Chisq")
+```
+
+The difference between the null deviance and the residual deviance shows how my model is doing against the null model. The wider this gap, the better. Analyzing the table I find that the drop in deviance when adding each variable one at a time. Adding query_title_score, job_age_days significantly reduces the residual deviance. The other variables seem to improve the model less.
+
+In the steps above, I briefly evaluated the fitting of the model, now I would like to see how the model is doing when predicting y on a new set of data. By setting the parameter type='apply', R will output probabilities in the form of P(y=1|X). My decision boundary will be 0.5. If P(y=1|X) > 0.5 then y = 1 otherwise y=0. 
+
+```{r}
+fitted.results <- predict(model,newdata=subset(test,select=c(1,2,3,4,5,6,7)),type='response')
+
+fitted.results <- ifelse(fitted.results > 0.5,1,0)
+
+misClasificError<-table(fitted.results != test$apply)['TRUE']/nrow(test)
+
+print(paste('Accuracy of Logistic Regression',1-misClasificError))
+```
+
+The 90.91% accuracy on the test set is quite a good result. However, this result is somewhat dependent on the split of the data that I made earlier, therefore for a more precise score, I would be better off running some kind of cross validation such as k-fold cross validation for the next time.
+
+As a last step, I am going to plot the ROC curve and calculate the AUC (area under the curve) which are typical performance measurements for a binary classifier. The ROC is a curve generated by plotting the true positive rate (TPR) against the false positive rate (FPR) at various threshold settings while the AUC is the area under the ROC curve. As a rule of thumb, a model with good predictive ability should have an AUC closer to 1 (1 is ideal) than to 0.5.
+
+```{r}
+p <- predict(model, newdata=subset(test, type="response"))
+pr <- prediction(p, test$apply)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+The AUC is 0.5871295 here, which is not as good as I expect. So, let's try other models next!
+
+##gbm model
+
+Then let's try to use the gradient boosting model. For GBM, CART is used and XGBoost also utilizes an algorithm similar to CART. 
+
+```{r}
+# save the outcome for the gbm model
+tempOutcome <- allSet$apply  
+
+# generalize outcome and predictor variables
+outcomeName <- 'apply'
+predictorsNames <- names(train)[names(train) != outcomeName]
+train1<-train
+test1<-test
+train1$apply <- ifelse(train1$apply==1,'yes','nope')
+test1$apply <- ifelse(test1$apply==1,'yes','nope')
+
+# create caret trainControl object to control the number of cross-validations performed
+objControl <- trainControl(method='cv', number=3, returnResamp='none', summaryFunction = twoClassSummary, classProbs = TRUE)
+
+
+# run model
+objModel <- train(train1[,predictorsNames], as.factor(train1[,outcomeName]), 
+                  method='gbm', 
+                  trControl=objControl,  
+                  metric = "ROC",
+                  preProc = c("center", "scale"))
+
+
+summary(objModel)
+print(objModel)
+```
+
+We now call the predict function and pass it our trained model and our testing data. Let’s start by looking at class predictions and using the caret postResample function to get an accuracy score:
+
+```{r}
+predictions <- predict(object=objModel, test1[,predictorsNames], type='raw')
+print(postResample(pred=predictions, obs=as.factor(test1[,outcomeName])))
+```
+
+The accuracy rate of gbm model is 90.91%. Now let’s look at probabilities:
+
+```{r}
+predictions <- predict(object=objModel, test1[,predictorsNames], type='prob')
+head(predictions)
+```
+
+To get the AUC score, we need to pass the yes column to the roc function:
+
+```{r}
+auc <- roc(ifelse(test1[,outcomeName]=="yes",1,0), predictions[[2]])
+auc
+print(auc$auc)
+```
+
+This is a higher AUC score than our previous logistic regression model, but AUC is not a the-higher-the-better metric, like accuracy. Testing with different types of models does pay off.
+
+We can also call the caret function varImp to figure out the variables that were important to the model.
+
+```{r}
+plot(varImp(objModel,scale=F))
+```
+
+# Subset the whole dataset according to the class of job titles
+## Choose one typical class of job title
+```{r}
+unique(allSet$mgoc_id)
+```
+
+There are 157 unique classes of job titles in all. Then let's choose one class as an example.
+
+## Resplit the data
+```{r}
+allSetClass <- allSet[allSet$mgoc_id == 10148,]
+train_class <- allSetClass[allSetClass$mgoc_id == 10148,]
+train_class <- train_class[-c(9,10,11)]
+test_class <- allSetClass[allSetClass$search_date_pacific == '2018-01-27',]
+test_class <- test_class[-c(9,10,11)]
+```
+
+# Redo the model training and testing
+
+## Rerun the logistic model
+```{r}
+model_class <- glm(apply ~.,family=binomial(link='logit'),data=train_class)
+summary(model_class)
+
+fitted.results2 <- predict(model_class,newdata=subset(test,select=c(1,2,3,4,5,6,7)),type='response')
+
+fitted.results2 <- ifelse(fitted.results > 0.5,1,0)
+
+misClasificError2<-table(fitted.results != test$apply)['TRUE']/nrow(test)
+
+print(paste('Accuracy of Logistic Regression',1-misClasificError2))
+```
+
+The accuracy rate of new logistic regression model is 90.91%, which is same with the accuracy of original logistic regression model.
+
+```{r}
+p <- predict(model_class, newdata=subset(test_class, type="response"))
+pr <- prediction(p, test_class$apply)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+The AUC is 0.5518136 here, which is lower than the AUC of the original logistic regression model.
+
+## Rerun the gbm model
+
+```{r}
+
+train_class$apply <- ifelse(train_class$apply==1,'yes','nope')
+test_class$apply <- ifelse(test_class$apply==1,'yes','nope')
+
+
+# run model
+objModel <- train(train_class[,predictorsNames], as.factor(train_class[,outcomeName]), 
+                  method='gbm', 
+                  trControl=objControl,  
+                  metric = "ROC",
+                  preProc = c("center", "scale"))
+
+
+summary(objModel)
+print(objModel)
+
+
+predictions <- predict(object=objModel, test1[,predictorsNames], type='raw')
+print(postResample(pred=predictions, obs=as.factor(test1[,outcomeName])))
+```
+
+The accuracy rate of new gbm model is 90.8%, which is lower than the accuracy of original plm model.
+
+```{r}
+predictions <- predict(object=objModel, test1[,predictorsNames], type='prob')
+head(predictions)
+auc <- roc(ifelse(test1[,outcomeName]=="yes",1,0), predictions[[2]])
+auc
+print(auc$auc)
+```
+
+The AUC is 0.53, which is also lower than the AUC of the original model.
+
+#Conclusion
+
+For part 1:
+
+I run logistic regression model and gradient boosting model to predict whether the user will apply or not. For the logistic regression model, the accuracy rate is 90.91%; the AUC is 0.5869. For gradient boosting model, the accuracy rate is 90.91%; the AUC is 0.6043.
+
+According to these two models, we can conclude the importance and impact of the variables. The top 5 important variables are query_title_score, query_jl_score, title_proximity_tfidf, main_query_tfidf, and job_age_days. 
+
+- The most important one is query_title_score, which measures the popularity of query and job title pair. If the pair of query and job title is more popular, then the user is more likely to apply. This may be because the trend of job market will guide people's career paths. For instance, data scientists and machine learning engineers are very popular positions due to high salary and large demand from different industries. As a result, new graduates would, to some extent, follow others's career choices - applying hot job positions. 
+
+- The second important factor is query_jl_score, which is similar to the first one. The popularity of query and job listing pair, including title names, job description, and technical requirement, reflects the trend of job market. The popular the job position (or techniques that this position requires) is, the more likely people apply. 
+
+- The third important variable is title_proximity_tfidf, which measures the closeness of query and job title. According to the logistic regression results, the more accurate the query is, the more likely the user will apply. The reason is that when our website can answer people's query accurately, people will have more job matches based on their preference and interest. Of course, they are more likely to apply.
+
+- The fifth important variable is job_age_days. The negative relationship with the dependent variable, according to logistic regression results, is because the job listing may expire or no longer available. As a result, people will less likely to apply such positions.
+
+Overall, we can make people more likely to apply on our website in these ways: 
+  1) provide more accurate query results;
+  2) list keywords that are as popular as possible in the job listing (e.g. supply chain analyst is not a very popular position, but its job requirement includes analyzing data and writing metric reports, which is similar to data analyst. Thus, the title of this position can be changed to data analyst. This can attract more attention)
+  3) delete obsolete and expired job postings to reduce distraction
+
+For part 2:
+
+I segment users based on their interests and redo the model training and testing on the observations where the class ID of job title is 10148. For the new logistic regression model, the accuracy rate is 90.91%; the AUC is 0.5518136, which is lower than the AUC of the original logistic regression model. For gradient boosting model, the accuracy rate is 90.86%, which is lower than the accuracy of original plm model; the AUC is 0.5339, which is also lower than the AUC of the original model. Therefore, we cannot achieve a better classification performance on this new data set.
+
+#Improvement
+
+This result is somewhat dependent on the split of the data that I made earlier, therefore for a more precise score, I would be better off running some kind of cross validation such as k-fold cross validation for the next time.
+
+
